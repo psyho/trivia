@@ -1,0 +1,233 @@
+#!/usr/bin/env ruby
+
+require "stringio"
+require "pstore"
+require "fileutils"
+load File.expand_path("../trivia", __FILE__)
+
+def run_trivia(random_seed)
+  srand random_seed
+
+  capture_stdout do
+    print_errors_to_stdout do
+      run_ugly_trivia
+    end
+  end
+end
+
+def capture_stdout
+  begin
+    old_stdout = $stdout
+    $stdout = StringIO.new('','w')
+    yield
+    $stdout.string
+  ensure
+    $stdout = old_stdout
+  end
+end
+
+def print_errors_to_stdout
+  yield
+rescue => e
+  puts e
+  puts e.backtrace
+end
+
+def run_trivia_for(duration_in_s, starting_seed, increment)
+  start = Time.now
+  seed = starting_seed
+  results = {}
+
+  while Time.now - start < duration_in_s
+    results[seed] = run_trivia(seed)
+    seed += increment
+  end
+
+  results
+end
+
+def run_multicore_trivia(duration_in_s)
+  FileUtils.mkdir_p("golden-master")
+  num_cpus = guess_cpu_count
+  num_cpus.times do |cpu|
+    fork do
+      results = run_trivia_for(duration_in_s, cpu, num_cpus)
+
+      yield results, cpu
+    end
+  end
+  Process.waitall
+end
+
+def with_store(name, read_only: false)
+  store = PStore.new(name)
+  store.transaction(read_only) do
+    yield store
+  end
+end
+
+def with_golden_master(cpu, read_only: false, &block)
+  with_store("golden-master/golden-master.cpu#{cpu}", read_only: read_only, &block)
+end
+
+def with_failures(cpu, read_only: false, &block)
+  with_store("golden-master/failures/failures.cpu#{cpu}", read_only: read_only, &block)
+end
+
+def record_golden_master(duration_in_s)
+  run_multicore_trivia duration_in_s do |results, cpu|
+    with_golden_master(cpu) do |store|
+      results.each do |seed, out|
+        store[seed] = out
+      end
+    end
+  end
+end
+
+Failure = Struct.new(:seed, :actual, :expected)
+
+def run_tests(duration_in_s)
+  FileUtils.rm_rf("golden-master/failures")
+  FileUtils.mkdir_p("golden-master/failures")
+
+  run_multicore_trivia(duration_in_s) do |results, cpu|
+    failures = []
+
+    with_golden_master(cpu, read_only: true) do |golden|
+      results.each do |seed, actual|
+        next unless golden.root?(seed)
+        expected = golden[seed]
+        if actual != expected
+          failures << Failure.new(seed, actual, expected)
+        end
+      end
+    end
+
+    with_failures(cpu) do |store|
+      store[:failures] = failures
+      store[:count] = results.size
+    end
+  end
+
+  results = combined_test_results
+  print "Examples run: #{results[:count]}. "
+
+  if results[:failures].any?
+    puts "#{results[:failures].size} failures."
+    puts
+    puts "Re-run the failed examples with:"
+    results[:failures].take(5).each do |failure|
+      puts "  ./bin/golden-master run #{failure.seed}"
+    end
+    puts
+    first_failure = results[:failures].first
+    puts "Output from the first failure (seed #{first_failure.seed}):"
+    puts
+    puts first_failure.actual
+  else
+    puts "OK."
+  end
+
+  return results[:failures].empty?
+end
+
+def combined_test_results
+  results = { failures: [], count: 0 }
+  guess_cpu_count.times do |cpu|
+    with_failures(cpu, read_only: true) do |store|
+      results[:failures] += store[:failures]
+      results[:count] += store[:count]
+    end
+  end
+  results
+end
+
+def guess_cpu_count
+  if File.readable?("/proc/cpuinfo")
+    IO.read("/proc/cpuinfo").scan(/^processor/).size
+  elsif File.executable?("/usr/bin/hwprefs")
+    IO.popen("/usr/bin/hwprefs thread_count").read.to_i
+  else
+    2
+  end
+end
+
+class CLI
+  def self.run(argv)
+    new(argv).parse_and_execute_command
+  end
+
+  attr_reader :argv
+
+  def initialize(argv)
+    @argv = argv
+  end
+
+  def parse_and_execute_command
+    case command
+    when "record"
+      record
+    when "run"
+      run
+    when "test"
+      test
+    else
+      help
+    end
+  end
+
+  private
+
+  def help
+    puts "Usage:"
+    puts
+    puts "golden-master run [random seed]"
+    puts "  - runs the trivia game once, with optional random seed"
+    puts
+    puts "golden-master record [duration in seconds]"
+    puts "  - runs the trivia game for the given duration (10s by default)"
+    puts "    and stores the results for later comparisons"
+    puts
+    puts "golden-master test [duration in seconds]"
+    puts "  - runs the trivia game for the given duration (1s by default)"
+    puts "    and compares the results with results recorded previously"
+    puts "    using `golden-master record`"
+    puts
+    puts "golden-master help"
+    puts "  - displays this help message"
+  end
+
+  def run
+    seed = parse_int_arg(1) { 1000 * Time.now.to_f }
+    puts run_trivia(seed)
+  end
+
+  def record
+    duration = parse_float_arg(1) { 10 }
+    record_golden_master(duration)
+  end
+
+  def test
+    duration = parse_float_arg(1) { 1 }
+    success = run_tests(duration)
+    exit success ? 0 : 1
+  end
+
+  def command
+    argv.first
+  end
+
+  def parse_int_arg(number, &default)
+    value = argv[number]
+    return default.call unless value
+    Integer(value)
+  end
+
+  def parse_float_arg(number, &default)
+    value = argv[number]
+    return default.call unless value
+    Float(value)
+  end
+end
+
+CLI.run(ARGV)
